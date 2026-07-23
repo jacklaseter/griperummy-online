@@ -158,6 +158,7 @@ export default function Game({ state, me, roomId, writeState }) {
   const handMinusStaged = orderedHand.filter((c) => !stagedIds.includes(c.id));
 
   function goDown() {
+    if (a) { setNote("Wait for the buy window to close."); return; }
     if (!myTurn || state.drawPhase) { setNote("You can only go down on your turn, after drawing."); return; }
     const left = handMinusStaged.length;
     const v = contract.goOut ? validateGoOut(staged, left, contract) : validateContract(staged, contract);
@@ -188,6 +189,7 @@ export default function Game({ state, me, roomId, writeState }) {
 
   /* ----------------- laying off ----------------- */
   function tapMeld(meldId) {
+    if (a) { setNote("Wait for the buy window to close."); return; }
     if (!myTurn || state.drawPhase) { setNote("You can only lay off on your turn, after drawing."); return; }
     if (!iAmDown) { setNote("Complete your contract before laying off."); return; }
     const cards = selCards();
@@ -212,6 +214,8 @@ export default function Game({ state, me, roomId, writeState }) {
 
   /* ----------------- discarding + opening the buy window ----------------- */
   function discard() {
+    // once you discard, a buy window opens and your turn is over — no second discard
+    if (a) { setNote("The buy window is open — your turn is finished."); return; }
     if (!myTurn || state.drawPhase || sel.length !== 1) return;
     if (staged.length) { setNote("Finish going down or clear your staged melds first."); return; }
     const s = clone(state);
@@ -362,7 +366,7 @@ export default function Game({ state, me, roomId, writeState }) {
   const iAmFree = a && a.freeTaker === mySeat && !a.freeDecided;
   const iCanBid = a && a.priority.includes(mySeat);
   const opponents = players.filter((p) => p.seat !== mySeat);
-  const canLay = myTurn && !state.drawPhase && iAmDown && sel.length === 1;
+  const canLay = myTurn && !state.drawPhase && !a && iAmDown && sel.length === 1;
 
   return (
     <Room>
@@ -474,17 +478,17 @@ export default function Game({ state, me, roomId, writeState }) {
           </div>
         </div>
         <div style={K.actions}>
-          {myTurn && !state.drawPhase && !iAmDown && <>
+          {myTurn && !state.drawPhase && !a && !iAmDown && <>
             <button style={K.btn} onClick={stageSet} disabled={sel.length < 3}>Set</button>
             <button style={K.btn} onClick={stageRun} disabled={sel.length < 3}>Run</button>
             <button style={{ ...K.btn, ...K.btnGold }} onClick={goDown} disabled={!staged.length}>{contract.goOut ? "Go out" : "Go down"}</button>
           </>}
-          {myTurn && !state.drawPhase && <button style={{ ...K.btn, ...K.btnBarn }} onClick={discard} disabled={sel.length !== 1 || staged.length > 0}>Discard</button>}
+          {myTurn && !state.drawPhase && !a && <button style={{ ...K.btn, ...K.btnBarn }} onClick={discard} disabled={sel.length !== 1 || staged.length > 0}>Discard</button>}
         </div>
       </div>
 
       <div style={K.banner}>
-        {note || (a ? "Buy window open — the table is deciding."
+        {note || (a ? (a.discarder === mySeat ? "You discarded — the buy window is open. Your turn is finished." : "Buy window open — the table is deciding.")
           : myTurn ? (state.drawPhase ? "Your turn — draw from the stock or take the discard." : "Meld, lay off, then discard.")
           : `Waiting on ${seatName(state.turn)}…`)}
       </div>
