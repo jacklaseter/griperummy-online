@@ -156,3 +156,69 @@ export function buyOrder(discarder, numPlayers) {
 export function scoreHand(hands) {
   return hands.map((h) => h.reduce((s, c) => s + cardScore(c), 0));
 }
+
+/* =========================================================================
+   Lay-off / wild-covering helpers (ported from the single-device build)
+   ========================================================================= */
+export function runEnds(meld) {
+  const lo = meld.seq[0].val, hi = meld.seq[meld.seq.length - 1].val;
+  return { lo, hi, canLow: lo - 1 >= 1, canHigh: hi + 1 <= 14 };
+}
+export function cardFitsRunEnd(meld, card, end) {
+  const { lo, hi, canLow, canHigh } = runEnds(meld);
+  if (isWild(card)) return end === "low" ? canLow : canHigh;
+  if (card.suit !== meld.suit) return false;
+  const targets = card.rank === 1 ? [1, 14] : [card.rank];
+  if (end === "low") return canLow && targets.includes(lo - 1);
+  return canHigh && targets.includes(hi + 1);
+}
+export function validRunEndsFor(meld, card) {
+  const ends = [];
+  if (cardFitsRunEnd(meld, card, "low")) ends.push("low");
+  if (cardFitsRunEnd(meld, card, "high")) ends.push("high");
+  return ends;
+}
+export function extendRun(meld, card, end) {
+  const { lo, hi } = runEnds(meld);
+  const val = end === "low" ? lo - 1 : hi + 1;
+  const entry = { card, val, wild: isWild(card) };
+  const seq = end === "low" ? [entry, ...meld.seq] : [...meld.seq, entry];
+  return { ...meld, seq };
+}
+export function cardFitsSet(meld, card) { return isWild(card) || card.rank === meld.rank; }
+/* interior wilds that this true card may cover (wild stays locked underneath) */
+export function coverTargetsInRun(meld, card) {
+  if (meld.type !== "run" || isWild(card) || card.suit !== meld.suit) return [];
+  const vals = card.rank === 1 ? [1, 14] : [card.rank];
+  const res = [];
+  meld.seq.forEach((e, i) => { if (e.wild && !e.coveredBy && vals.includes(e.val)) res.push(i); });
+  return res;
+}
+/* every legal spot this card could take on a meld */
+export function layoffOptions(meld, card) {
+  if (meld.type === "set") return cardFitsSet(meld, card) ? [{ kind: "set" }] : [];
+  const opts = [];
+  validRunEndsFor(meld, card).forEach((end) => opts.push({ kind: "end", end }));
+  coverTargetsInRun(meld, card).forEach((i) => opts.push({ kind: "cover", index: i }));
+  return opts;
+}
+export function applyLayoff(meld, card, opt) {
+  if (opt.kind === "set") return { ...meld, cards: meld.cards.concat([card]) };
+  if (opt.kind === "end") return extendRun(meld, card, opt.end);
+  return { ...meld, seq: meld.seq.map((e, i) => (i === opt.index ? { ...e, coveredBy: card } : e)) };
+}
+/* Hand 7: lay everything down and go out in one move. */
+export function validateGoOut(groups, handAfter, contract) {
+  const info = groups.map((g) => classify(g.cards, g.type === "run" ? contract.runMin : 3));
+  if (info.some((x) => x === null)) return { ok: false, why: "One group isn't a legal meld." };
+  const sets = info.filter((x) => x.type === "set");
+  const runs = info.filter((x, i) => x.type === "run" && groups[i].cards.length >= contract.runMin);
+  const setRanks = [...new Set(sets.map((s) => s.rank))];
+  if (sets.length < contract.sets.length || setRanks.length < contract.sets.length)
+    return { ok: false, why: `Lay down at least ${contract.sets.length} sets of 3 (different ranks).` };
+  const runSuits = [...new Set(runs.map((r) => r.suit))];
+  if (runs.length < contract.runs.length || runSuits.length < contract.runs.length)
+    return { ok: false, why: `Lay down at least ${contract.runs.length} run(s) of ${contract.runMin} (different suits).` };
+  if (handAfter !== 1) return { ok: false, why: `Keep exactly one card to discard — you have ${handAfter}.` };
+  return { ok: true };
+}

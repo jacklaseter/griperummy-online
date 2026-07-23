@@ -2,7 +2,8 @@ import React, { useEffect, useState, useCallback } from "react";
 import { supabase, myClientId } from "./supabase.js";
 import Lobby from "./Lobby.jsx";
 import Game from "./Game.jsx";
-import { dealHand, CONTRACTS } from "./engine.js";
+import { dealHand } from "./engine.js";
+import { openAuction } from "./auction.js";
 
 /* =========================================================================
    App — the spine of the online game.
@@ -106,7 +107,10 @@ export default function App() {
       handNo: 0, dealer: 0, turn: firstPlayer, drawPhase: true,
       totals: Array(n).fill(0),
       hands: handsById, stock, discard,
-      down: Array(n).fill(false), table: [], log: [`Hand 1 dealt. ${s.players[firstPlayer].name} starts.`],
+      down: Array(n).fill(false), table: [],
+      // the opening flip is immediately live for a free take or a buy
+      auction: openAuction({ card: discard[0], discarder: 0, numPlayers: n }),
+      log: [`Hand 1 dealt. Flip is live — ${s.players[firstPlayer].name} may take it free.`],
     });
   }
 
