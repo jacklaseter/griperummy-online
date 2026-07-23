@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   CONTRACTS, RANK_LABEL, SUIT_GLYPH, isWild, cardFace, valFace,
   checkSet, runWindows, validateContract, validateGoOut,
@@ -50,6 +50,68 @@ export default function Game({ state, me, roomId, writeState }) {
   const clone = (s) => JSON.parse(JSON.stringify(s));
   const log = (s, m) => { s.log = [...(s.log || []), m].slice(-40); };
 
+  /* ----------------- personal hand arrangement -----------------
+     Your card order is private to your own browser: nobody else needs to see
+     how you've grouped your hand, and rearranging shouldn't cost a network
+     write. New cards (drawn or bought) land at the end; everything you've
+     already arranged stays put — including between turns and across hands. */
+  const [order, setOrder] = useState([]);
+  const handKey = myHand.map((c) => c.id).join(",");
+  useEffect(() => {
+    const ids = myHand.map((c) => c.id);
+    setOrder((prev) => {
+      const kept = prev.filter((id) => ids.includes(id));
+      const added = ids.filter((id) => !kept.includes(id));
+      const next = kept.concat(added);
+      if (next.length === prev.length && next.every((v, i) => v === prev[i])) return prev;
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handKey]);
+  const orderedHand = order.map((id) => myHand.find((c) => c.id === id)).filter(Boolean);
+
+  /* pointer-based drag: works with a mouse AND on touch screens, and is
+     available any time — including while a buy window is counting down. */
+  const dragRef = useRef(null);
+  const [dragId, setDragId] = useState(null);
+  const [dropIdx, setDropIdx] = useState(null);
+  function visibleIds() { return handMinusStaged.map((c) => c.id); }
+  function idxAtPoint(x, y) {
+    const el = document.elementFromPoint(x, y);
+    const holder = el && el.closest ? el.closest("[data-cardid]") : null;
+    if (!holder) return null;
+    const id = holder.getAttribute("data-cardid");
+    const i = visibleIds().findIndex((v) => String(v) === id);
+    return i >= 0 ? i : null;
+  }
+  function moveCard(id, toVisibleIdx) {
+    const targetId = visibleIds()[toVisibleIdx];
+    setOrder((prev) => {
+      const arr = prev.slice();
+      const from = arr.indexOf(id), to = arr.indexOf(targetId);
+      if (from < 0 || to < 0 || from === to) return prev;
+      const [m] = arr.splice(from, 1); arr.splice(to, 0, m);
+      return arr;
+    });
+  }
+  function onCardDown(e, id) {
+    dragRef.current = { id, x: e.clientX, y: e.clientY, moved: false };
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+  }
+  function onCardMove(e) {
+    const d = dragRef.current; if (!d) return;
+    if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 8) { d.moved = true; setDragId(d.id); }
+    if (d.moved) { const i = idxAtPoint(e.clientX, e.clientY); if (i != null) setDropIdx(i); }
+  }
+  function onCardUp(e) {
+    const d = dragRef.current; dragRef.current = null;
+    if (!d) return;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (!d.moved) setSel((sl) => (sl.includes(d.id) ? sl.filter((x) => x !== d.id) : sl.concat(d.id)));
+    else if (dropIdx != null) moveCard(d.id, dropIdx);
+    setDragId(null); setDropIdx(null);
+  }
+
   /* ----------------- drawing ----------------- */
   function draw(fromDiscard) {
     if (!myTurn || !state.drawPhase || a) return;
@@ -93,7 +155,7 @@ export default function Game({ state, me, roomId, writeState }) {
     setSel([]); setPlaceRun(null); setNote("");
   }
   const stagedIds = staged.flatMap((g) => g.cards.map((c) => c.id));
-  const handMinusStaged = myHand.filter((c) => !stagedIds.includes(c.id));
+  const handMinusStaged = orderedHand.filter((c) => !stagedIds.includes(c.id));
 
   function goDown() {
     if (!myTurn || state.drawPhase) { setNote("You can only go down on your turn, after drawing."); return; }
@@ -206,17 +268,30 @@ export default function Game({ state, me, roomId, writeState }) {
   function endHand(s) {
     const bySeat = players.map((p) => s.hands[p.id] || []);
     const scores = scoreHand(bySeat);
+    const wentOut = bySeat.findIndex((h) => h.length === 0);
     s.totals = s.totals.map((t, i) => t + scores[i]);
     s.auction = null;
-    if (s.handNo + 1 >= 7) { s.phase = "over"; log(s, "Game over."); return; }
+    // pause on a scoreboard everyone can read before the next deal
+    s.handScores = { scores, wentOut, handNo: s.handNo };
+    s.phase = s.handNo + 1 >= 7 ? "over" : "handover";
+    log(s, `Hand ${s.handNo + 1} over — ${seatName(wentOut)} went out.`);
+  }
+
+  /* Deal the next hand. Any player can advance the table, so nobody is
+     stuck waiting on someone who stepped away from their screen. */
+  function dealNextHand() {
+    const s = clone(state);
     const hn = s.handNo + 1, dl = (s.dealer + 1) % n;
     const d = dealHand(hn, dl, n);
     const byId = {}; players.forEach((p) => { byId[p.id] = d.hands[p.seat]; });
     s.handNo = hn; s.dealer = dl; s.turn = d.firstPlayer; s.drawPhase = true;
     s.hands = byId; s.stock = d.stock; s.discard = d.discard;
     s.down = Array(n).fill(false); s.table = [];
+    s.phase = "playing"; s.handScores = null;
     log(s, `Hand ${hn + 1} dealt by ${seatName(dl)}. ${seatName(d.firstPlayer)} starts.`);
     s.auction = AU.openAuction({ card: d.discard[0], discarder: dl, numPlayers: n }); // opening flip is live
+    setStaged([]); setSel([]); setNote("");
+    writeState(s);
   }
 
   function newGame() {
@@ -226,7 +301,7 @@ export default function Game({ state, me, roomId, writeState }) {
     Object.assign(s, {
       phase: "playing", handNo: 0, dealer: 0, turn: d.firstPlayer, drawPhase: true,
       totals: Array(n).fill(0), hands: byId, stock: d.stock, discard: d.discard,
-      down: Array(n).fill(false), table: [], auction: null,
+      down: Array(n).fill(false), table: [], auction: null, handScores: null,
       log: [`New game. ${seatName(d.firstPlayer)} starts.`],
     });
     s.auction = AU.openAuction({ card: d.discard[0], discarder: 0, numPlayers: n });
@@ -234,15 +309,45 @@ export default function Game({ state, me, roomId, writeState }) {
   }
 
   /* ============================ RENDER ============================ */
-  if (state.phase === "over") {
-    const ranked = [...players].sort((x, y) => state.totals[x.seat] - state.totals[y.seat]);
+  // scoreboard between hands — everyone reads it, anyone can deal on
+  if (state.phase === "handover" && state.handScores) {
+    const hs = state.handScores;
     return (
       <Room>
-        <div style={{ ...K.sheetBox, margin: "60px auto" }}>
+        <div style={{ ...K.sheetBox, margin: "40px auto" }}>
+          <div style={K.sheetTitle}>Hand {hs.handNo + 1} scored</div>
+          <div style={K.sheetText}>{seatName(hs.wentOut)} went out.</div>
+          <div style={K.scoreHead}><span>Player</span><span>This hand</span><span>Total</span></div>
+          {players.map((p) => (
+            <div key={p.id} style={K.scoreRow}>
+              <span>{p.seat === hs.wentOut ? "\u{1F3C6} " : ""}{p.name}{p.seat === mySeat ? " (you)" : ""}</span>
+              <span style={{ color: hs.scores[p.seat] === 0 ? "#2f7d3a" : INK }}>+{hs.scores[p.seat]}</span>
+              <b>{state.totals[p.seat]}</b>
+            </div>
+          ))}
+          <button style={{ ...K.btn, ...K.btnGold, width: "100%", marginTop: 14 }} onClick={dealNextHand}>
+            Deal hand {hs.handNo + 2} — {CONTRACTS[hs.handNo + 1].label}
+          </button>
+          <div style={K.sheetNote}>Anyone at the table can deal on.</div>
+        </div>
+      </Room>
+    );
+  }
+
+  if (state.phase === "over") {
+    const ranked = [...players].sort((x, y) => state.totals[x.seat] - state.totals[y.seat]);
+    const hs = state.handScores;
+    return (
+      <Room>
+        <div style={{ ...K.sheetBox, margin: "40px auto" }}>
           <div style={K.sheetTitle}>Final result</div>
+          {hs && <div style={K.sheetText}>Hand 7: {seatName(hs.wentOut)} went out.</div>}
+          <div style={K.scoreHead}><span>Player</span><span>Hand 7</span><span>Total</span></div>
           {ranked.map((p, i) => (
-            <div key={p.id} style={K.scoreLine}>
-              <span>{i === 0 ? "\u{1F451} " : `${i + 1}. `}{p.name}</span><b>{state.totals[p.seat]}</b>
+            <div key={p.id} style={K.scoreRow}>
+              <span>{i === 0 ? "\u{1F451} " : `${i + 1}. `}{p.name}{p.seat === mySeat ? " (you)" : ""}</span>
+              <span>{hs ? `+${hs.scores[p.seat]}` : ""}</span>
+              <b>{state.totals[p.seat]}</b>
             </div>
           ))}
           <div style={K.sheetText}>Lowest total wins. Well griped.</div>
@@ -401,13 +506,28 @@ export default function Game({ state, me, roomId, writeState }) {
 
       <div style={K.handLabel}>Your hand · {handMinusStaged.length} cards</div>
       <div style={K.hand}>
-        {handMinusStaged.map((c) => (
-          <div key={c.id} onClick={() => setSel(sel.includes(c.id) ? sel.filter((x) => x !== c.id) : sel.concat(c.id))}
-            style={{ cursor: "pointer", transform: sel.includes(c.id) ? "translateY(-12px)" : "none", transition: "transform .1s" }}>
-            <Card c={c} selected={sel.includes(c.id)} />
-          </div>
-        ))}
+        {handMinusStaged.map((c, idx) => {
+          const isDragging = dragId === c.id;
+          const isTarget = dragId != null && dropIdx === idx && !isDragging;
+          return (
+            <div key={c.id} data-cardid={c.id}
+              onPointerDown={(e) => onCardDown(e, c.id)}
+              onPointerMove={onCardMove}
+              onPointerUp={onCardUp}
+              onPointerCancel={() => { dragRef.current = null; setDragId(null); setDropIdx(null); }}
+              style={{
+                cursor: "grab", touchAction: "none",
+                marginLeft: isTarget ? 14 : 0,
+                opacity: isDragging ? 0.45 : 1,
+                transform: sel.includes(c.id) ? "translateY(-12px)" : "none",
+                transition: "transform .1s, margin-left .12s, opacity .1s",
+              }}>
+              <Card c={c} selected={sel.includes(c.id)} />
+            </div>
+          );
+        })}
       </div>
+      <div style={K.handHint}>Tap a card to select · drag to arrange — your order stays put, and you can rearrange any time, even during a buy window.</div>
 
       <div style={K.log}>{(state.log || []).slice(-4).reverse().map((l, i) => <div key={i} style={{ opacity: 1 - i * 0.18 }}>{l}</div>)}</div>
 
@@ -528,10 +648,14 @@ const K = {
   card: { width: 48, height: 68, background: CREAM, borderRadius: 8, border: "1px solid rgba(60,40,20,.35)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: "0 2px 5px rgba(0,0,0,.3)", userSelect: "none" },
   cardSm: { width: 42, height: 60 },
   cardSel: { boxShadow: `0 0 0 2px ${HONEY}, 0 8px 14px rgba(0,0,0,.45)` },
+  handHint: { marginTop: 8, fontSize: 11, opacity: 0.65, fontFamily: "ui-sans-serif,system-ui" },
   log: { marginTop: 14, fontSize: 11.5, fontFamily: "ui-monospace,monospace", lineHeight: 1.6, opacity: 0.85 },
   sheet: { position: "fixed", inset: 0, background: "rgba(30,20,10,.68)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 80, padding: 16 },
   sheetBox: { background: `linear-gradient(${LINEN},#e3d3b2)`, border: `2px solid ${HONEY}`, borderRadius: 16, padding: 20, width: "100%", maxWidth: 420, color: INK },
   sheetTitle: { fontSize: 19, fontWeight: 800, textAlign: "center", marginBottom: 12 },
   sheetText: { fontSize: 13, color: "#6b5232", textAlign: "center", margin: "10px 0", fontFamily: "ui-sans-serif,system-ui" },
   scoreLine: { display: "flex", justifyContent: "space-between", padding: "8px 12px", background: "rgba(255,255,255,.45)", borderRadius: 8, marginBottom: 6, fontSize: 15, fontFamily: "ui-sans-serif,system-ui" },
+  scoreHead: { display: "grid", gridTemplateColumns: "1fr auto auto", gap: 14, padding: "4px 12px", fontSize: 10.5, textTransform: "uppercase", letterSpacing: 1, color: "#8a6f47", fontFamily: "ui-sans-serif,system-ui" },
+  scoreRow: { display: "grid", gridTemplateColumns: "1fr auto auto", gap: 14, alignItems: "center", padding: "9px 12px", background: "rgba(255,255,255,.5)", borderRadius: 8, marginBottom: 6, fontSize: 15, fontFamily: "ui-sans-serif,system-ui" },
+  sheetNote: { fontSize: 11, color: "#8a6f47", textAlign: "center", marginTop: 8, fontStyle: "italic", fontFamily: "ui-sans-serif,system-ui" },
 };
