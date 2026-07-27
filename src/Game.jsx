@@ -6,10 +6,8 @@ import {
 } from "./engine.js";
 import * as AU from "./auction.js";
 
-/* =========================================================================
-   The full online game: melding, laying off, wild covering, the buy auction,
-   and the kitchen-table look — all synced through the shared room state.
-   ========================================================================= */
+/* Full online game: melding, laying off, wild covering, the buy auction,
+   the between-hands scoreboard, personal hand sorting, and the kitchen look. */
 
 export default function Game({ state, me, roomId, writeState }) {
   const players = [...state.players].sort((a, b) => a.seat - b.seat);
@@ -28,20 +26,38 @@ export default function Game({ state, me, roomId, writeState }) {
   const [placeRun, setPlaceRun] = useState(null);
   const [, tick] = useState(0);
 
-  // drive the countdown display (the deadline itself lives in shared state)
+  // drive the countdown display (deadline itself lives in shared state)
   useEffect(() => {
     if (!a) return;
     const t = setInterval(() => tick((x) => x + 1), 200);
     return () => clearInterval(t);
   }, [a]);
 
-  // the discarder's browser closes an expired window (one writer, no races)
+  /* -------- THE FIX: close an expired buy window reliably --------
+     The old code closed the window on a short setTimeout, but the 0.2s
+     countdown re-render kept cancelling that timeout before it fired, so the
+     window hung at 0.0s forever. Now we close IMMEDIATELY (no cancellable
+     timer) using a ref so it fires exactly once per auction. The discarder is
+     the primary closer; if their browser is away, the free-taker closes it as
+     a fallback a moment later. The stagger + last-write-wins keeps the two
+     from colliding. */
+  const closedRef = useRef(null);
   useEffect(() => {
-    if (!a || a.discarder !== mySeat) return;
-    if (!AU.isExpired(a) && !AU.canResolveEarly(a)) return;
-    const id = setTimeout(() => resolveAuction(), 250);
-    return () => clearTimeout(id);
-  });
+    if (!a) { closedRef.current = null; return; }
+    const expired = AU.isExpired(a);
+    const early = AU.canResolveEarly(a);
+    if (!expired && !early) return;
+    if (closedRef.current === a.startedAt) return; // already handled this auction here
+
+    const amPrimary = a.discarder === mySeat;
+    const amFallback = a.freeTaker === mySeat;
+    // primary acts at once; fallback only if it's been expired a beat longer
+    const overdueForFallback = expired && Date.now() >= a.deadline + 2500;
+    if (amPrimary || (amFallback && overdueForFallback)) {
+      closedRef.current = a.startedAt;
+      resolveAuction();
+    }
+  }); // no dep array on purpose: re-checks each render/tick, guarded by the ref
 
   const seatName = (s) => players.find((p) => p.seat === s)?.name || "—";
   const myName = () => players.find((p) => p.id === me)?.name;
@@ -50,11 +66,7 @@ export default function Game({ state, me, roomId, writeState }) {
   const clone = (s) => JSON.parse(JSON.stringify(s));
   const log = (s, m) => { s.log = [...(s.log || []), m].slice(-40); };
 
-  /* ----------------- personal hand arrangement -----------------
-     Your card order is private to your own browser: nobody else needs to see
-     how you've grouped your hand, and rearranging shouldn't cost a network
-     write. New cards (drawn or bought) land at the end; everything you've
-     already arranged stays put — including between turns and across hands. */
+  /* -------- personal hand arrangement (local to this browser) -------- */
   const [order, setOrder] = useState([]);
   const handKey = myHand.map((c) => c.id).join(",");
   useEffect(() => {
@@ -70,8 +82,6 @@ export default function Game({ state, me, roomId, writeState }) {
   }, [handKey]);
   const orderedHand = order.map((id) => myHand.find((c) => c.id === id)).filter(Boolean);
 
-  /* pointer-based drag: works with a mouse AND on touch screens, and is
-     available any time — including while a buy window is counting down. */
   const dragRef = useRef(null);
   const [dragId, setDragId] = useState(null);
   const [dropIdx, setDropIdx] = useState(null);
@@ -112,7 +122,7 @@ export default function Game({ state, me, roomId, writeState }) {
     setDragId(null); setDropIdx(null);
   }
 
-  /* ----------------- drawing ----------------- */
+  /* -------- drawing -------- */
   function draw(fromDiscard) {
     if (!myTurn || !state.drawPhase || a) return;
     const s = clone(state);
@@ -136,12 +146,11 @@ export default function Game({ state, me, roomId, writeState }) {
     log(s, "Stock ran out — discard reshuffled.");
   }
 
-  /* ----------------- melding ----------------- */
+  /* -------- melding -------- */
   function stageSet() {
     const cards = selCards();
     if (!checkSet(cards, 3)) { setNote("Those cards aren't a legal set."); return; }
-    setStaged(staged.concat([{ type: "set", cards }]));
-    setSel([]); setNote("");
+    setStaged(staged.concat([{ type: "set", cards }])); setSel([]); setNote("");
   }
   function stageRun() {
     const cards = selCards();
@@ -164,7 +173,6 @@ export default function Game({ state, me, roomId, writeState }) {
     const v = contract.goOut ? validateGoOut(staged, left, contract) : validateContract(staged, contract);
     if (!v.ok) { setNote(v.why); return; }
     if (!contract.goOut && left === 0) { setNote("Keep at least one card to discard."); return; }
-
     const s = clone(state);
     const melds = staged.map((g, i) => {
       if (g.type === "set") return { owner: mySeat, type: "set", rank: checkSet(g.cards, 3).rank, cards: g.cards, id: `${mySeat}-${Date.now()}-${i}` };
@@ -176,7 +184,6 @@ export default function Game({ state, me, roomId, writeState }) {
     s.hands[me] = handMinusStaged;
     log(s, `${myName()} went down.`);
     setStaged([]); setSel([]); setNote("");
-
     if (contract.goOut) {
       const last = s.hands[me][0];
       s.hands[me] = [];
@@ -187,7 +194,7 @@ export default function Game({ state, me, roomId, writeState }) {
     writeState(s);
   }
 
-  /* ----------------- laying off ----------------- */
+  /* -------- laying off -------- */
   function tapMeld(meldId) {
     if (a) { setNote("Wait for the buy window to close."); return; }
     if (!myTurn || state.drawPhase) { setNote("You can only lay off on your turn, after drawing."); return; }
@@ -212,9 +219,8 @@ export default function Game({ state, me, roomId, writeState }) {
     writeState(s);
   }
 
-  /* ----------------- discarding + opening the buy window ----------------- */
+  /* -------- discarding + opening the buy window -------- */
   function discard() {
-    // once you discard, a buy window opens and your turn is over — no second discard
     if (a) { setNote("The buy window is open — your turn is finished."); return; }
     if (!myTurn || state.drawPhase || sel.length !== 1) return;
     if (staged.length) { setNote("Finish going down or clear your staged melds first."); return; }
@@ -229,7 +235,7 @@ export default function Game({ state, me, roomId, writeState }) {
     writeState(s);
   }
 
-  /* ----------------- the buy window ----------------- */
+  /* -------- the buy window -------- */
   function takeFree() {
     const s = clone(state);
     const seat = s.auction.freeTaker;
@@ -237,7 +243,7 @@ export default function Game({ state, me, roomId, writeState }) {
     s.hands[id] = s.hands[id].concat([s.discard.pop()]);
     log(s, `${seatName(seat)} took the ${cardFace(s.auction.card)} free.`);
     s.auction = null;
-    s.turn = seat; s.drawPhase = false;   // the free take was their draw
+    s.turn = seat; s.drawPhase = false;
     writeState(s);
   }
   function bid()      { const s = clone(state); s.auction = AU.placeBid(s.auction, mySeat);    writeState(s); }
@@ -263,26 +269,22 @@ export default function Game({ state, me, roomId, writeState }) {
       log(s, "No buyers.");
     }
     s.auction = null;
-    s.turn = au.freeTaker;   // play always continues clockwise from the discarder
+    s.turn = au.freeTaker;
     s.drawPhase = true;
     writeState(s);
   }
 
-  /* ----------------- hand end / scoring ----------------- */
+  /* -------- hand end / scoring -------- */
   function endHand(s) {
     const bySeat = players.map((p) => s.hands[p.id] || []);
     const scores = scoreHand(bySeat);
     const wentOut = bySeat.findIndex((h) => h.length === 0);
     s.totals = s.totals.map((t, i) => t + scores[i]);
     s.auction = null;
-    // pause on a scoreboard everyone can read before the next deal
     s.handScores = { scores, wentOut, handNo: s.handNo };
     s.phase = s.handNo + 1 >= 7 ? "over" : "handover";
     log(s, `Hand ${s.handNo + 1} over — ${seatName(wentOut)} went out.`);
   }
-
-  /* Deal the next hand. Any player can advance the table, so nobody is
-     stuck waiting on someone who stepped away from their screen. */
   function dealNextHand() {
     const s = clone(state);
     const hn = s.handNo + 1, dl = (s.dealer + 1) % n;
@@ -293,11 +295,10 @@ export default function Game({ state, me, roomId, writeState }) {
     s.down = Array(n).fill(false); s.table = [];
     s.phase = "playing"; s.handScores = null;
     log(s, `Hand ${hn + 1} dealt by ${seatName(dl)}. ${seatName(d.firstPlayer)} starts.`);
-    s.auction = AU.openAuction({ card: d.discard[0], discarder: dl, numPlayers: n }); // opening flip is live
+    s.auction = AU.openAuction({ card: d.discard[0], discarder: dl, numPlayers: n });
     setStaged([]); setSel([]); setNote("");
     writeState(s);
   }
-
   function newGame() {
     const s = clone(state);
     const d = dealHand(0, 0, n);
@@ -313,7 +314,6 @@ export default function Game({ state, me, roomId, writeState }) {
   }
 
   /* ============================ RENDER ============================ */
-  // scoreboard between hands — everyone reads it, anyone can deal on
   if (state.phase === "handover" && state.handScores) {
     const hs = state.handScores;
     return (
@@ -649,17 +649,16 @@ const K = {
   stagedMeld: { background: "rgba(200,143,63,.28)", border: `1px dashed ${HONEY}`, borderRadius: 8, padding: "5px 7px", display: "flex", flexDirection: "column", gap: 3, cursor: "pointer" },
   handLabel: { fontSize: 11, textTransform: "uppercase", letterSpacing: 2, color: HONEY, margin: "14px 0 8px", fontFamily: "ui-sans-serif,system-ui" },
   hand: { display: "flex", gap: 5, flexWrap: "wrap", minHeight: 74 },
+  handHint: { marginTop: 8, fontSize: 11, opacity: 0.65, fontFamily: "ui-sans-serif,system-ui" },
   card: { width: 48, height: 68, background: CREAM, borderRadius: 8, border: "1px solid rgba(60,40,20,.35)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: "0 2px 5px rgba(0,0,0,.3)", userSelect: "none" },
   cardSm: { width: 42, height: 60 },
   cardSel: { boxShadow: `0 0 0 2px ${HONEY}, 0 8px 14px rgba(0,0,0,.45)` },
-  handHint: { marginTop: 8, fontSize: 11, opacity: 0.65, fontFamily: "ui-sans-serif,system-ui" },
   log: { marginTop: 14, fontSize: 11.5, fontFamily: "ui-monospace,monospace", lineHeight: 1.6, opacity: 0.85 },
   sheet: { position: "fixed", inset: 0, background: "rgba(30,20,10,.68)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 80, padding: 16 },
   sheetBox: { background: `linear-gradient(${LINEN},#e3d3b2)`, border: `2px solid ${HONEY}`, borderRadius: 16, padding: 20, width: "100%", maxWidth: 420, color: INK },
   sheetTitle: { fontSize: 19, fontWeight: 800, textAlign: "center", marginBottom: 12 },
   sheetText: { fontSize: 13, color: "#6b5232", textAlign: "center", margin: "10px 0", fontFamily: "ui-sans-serif,system-ui" },
-  scoreLine: { display: "flex", justifyContent: "space-between", padding: "8px 12px", background: "rgba(255,255,255,.45)", borderRadius: 8, marginBottom: 6, fontSize: 15, fontFamily: "ui-sans-serif,system-ui" },
+  sheetNote: { fontSize: 11, color: "#8a6f47", textAlign: "center", marginTop: 8, fontStyle: "italic", fontFamily: "ui-sans-serif,system-ui" },
   scoreHead: { display: "grid", gridTemplateColumns: "1fr auto auto", gap: 14, padding: "4px 12px", fontSize: 10.5, textTransform: "uppercase", letterSpacing: 1, color: "#8a6f47", fontFamily: "ui-sans-serif,system-ui" },
   scoreRow: { display: "grid", gridTemplateColumns: "1fr auto auto", gap: 14, alignItems: "center", padding: "9px 12px", background: "rgba(255,255,255,.5)", borderRadius: 8, marginBottom: 6, fontSize: 15, fontFamily: "ui-sans-serif,system-ui" },
-  sheetNote: { fontSize: 11, color: "#8a6f47", textAlign: "center", marginTop: 8, fontStyle: "italic", fontFamily: "ui-sans-serif,system-ui" },
 };
